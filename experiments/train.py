@@ -21,6 +21,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 @dataclass
 class DataConfig:
+    """Настройки, связанные с датасетом.
+
+    Хранение параметров в дата-классе упрощает повторение эксперимента:
+    одни и те же пути, пропорция train/val и размер изображения используются
+    повторно, а через CLI меняются только нужные значения.
+    """
+
     raw_data_dir: Path = PROJECT_ROOT / "data" / "raw"
     processed_data_dir: Path = PROJECT_ROOT / "data" / "processed"
     train_ratio: float = 0.8
@@ -39,6 +46,8 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
+    """Гиперпараметры обучения и настройки воспроизводимости."""
+
     model_name: str = "resnet18"
     pretrained: bool = True
     batch_size: int = 16
@@ -46,14 +55,19 @@ class TrainConfig:
     epochs: int = 5
     seed: int = 42
     num_workers: int = 0
+    # Сначала обучается только новая классификационная голова, затем вся модель.
     freeze_backbone_epochs: int = 2
+    # После разморозки LR уменьшается, чтобы не разрушить предобученные признаки.
     unfreeze_lr_factor: float = 0.1
+    # Помогает при дисбалансе классов, когда изображений в классах разное число.
     use_class_weights: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @dataclass
 class ArtifactConfig:
+    """Пути и имена файлов для сохранения результатов эксперимента."""
+
     output_dir: Path = PROJECT_ROOT / "experiments" / "models"
     log_dir: Path = PROJECT_ROOT / "experiments" / "logs"
     deploy_dir: Path = PROJECT_ROOT / "experiments" / "models"
@@ -64,12 +78,16 @@ class ArtifactConfig:
 
 @dataclass
 class ExperimentConfig:
+    """Общая конфигурация: данные, обучение и выходные артефакты."""
+
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
 
 
 def set_seed(seed: int) -> None:
+    """Фиксирует генераторы случайных чисел для повторяемости запусков."""
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -79,6 +97,8 @@ def set_seed(seed: int) -> None:
 
 
 def config_to_jsonable(config: ExperimentConfig) -> dict:
+    """Преобразует конфигурацию в JSON-совместимый вид для summary/checkpoint."""
+
     payload = {
         "data": asdict(config.data),
         "train": asdict(config.train),
@@ -92,6 +112,18 @@ def config_to_jsonable(config: ExperimentConfig) -> dict:
 
 
 def prepare_data(config: DataConfig, seed: int) -> None:
+    """Создает train/val из data/raw, если data/processed еще не подготовлен.
+
+    data/raw должен соответствовать формату ImageFolder:
+        data/raw/class1/*.jpg
+        data/raw/class2/*.jpg
+        data/raw/class3/*.jpg
+
+    Если передан --force-resplit, старое разбиение удаляется и создается заново.
+    Это важно после изменения датасета, иначе обучение может взять старые
+    изображения из data/processed.
+    """
+
     if config.force_resplit and config.processed_data_dir.exists():
         shutil.rmtree(config.processed_data_dir)
 
@@ -108,6 +140,7 @@ def prepare_data(config: DataConfig, seed: int) -> None:
         print("[OK] data/processed already contains images; split is reused.")
         return
 
+    # Локальный RNG с фиксированным seed делает разбиение train/val повторяемым.
     rng = random.Random(seed)
     for class_dir in sorted(path for path in config.raw_data_dir.iterdir() if path.is_dir()):
         images = sorted(
@@ -133,6 +166,15 @@ def prepare_data(config: DataConfig, seed: int) -> None:
 
 
 def build_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Compose]:
+    """Создает preprocessing для обучения и валидации.
+
+    Train использует аугментации, чтобы модель была устойчивее к изменениям
+    изображений. Validation использует только детерминированную обработку,
+    чтобы метрики считались на стабильных, неизмененных данных.
+    """
+
+    # Нормализация ImageNet нужна, потому что предобученные timm-модели
+    # обучались именно на таком распределении входных изображений.
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
 
@@ -157,6 +199,8 @@ def build_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Co
 
 
 def make_loaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, list[str]]:
+    """Создает ImageFolder-датасеты и DataLoader-ы."""
+
     train_tfms, val_tfms = build_transforms(config.data.image_size)
     train_dataset = datasets.ImageFolder(
         config.data.processed_data_dir / "train", transform=train_tfms
@@ -165,6 +209,7 @@ def make_loaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, list
         config.data.processed_data_dir / "val", transform=val_tfms
     )
 
+    # Генератор с seed делает перемешивание DataLoader повторяемым.
     generator = torch.Generator().manual_seed(config.train.seed)
     train_loader = DataLoader(
         train_dataset,
@@ -183,6 +228,8 @@ def make_loaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, list
 
 
 def dataset_class_counts(dataset: datasets.ImageFolder, num_classes: int) -> list[int]:
+    """Считает количество изображений в каждом классе train-датасета."""
+
     counts = [0] * num_classes
     for label in dataset.targets:
         counts[label] += 1
@@ -190,6 +237,12 @@ def dataset_class_counts(dataset: datasets.ImageFolder, num_classes: int) -> lis
 
 
 def make_class_weights(counts: list[int], device: str) -> torch.Tensor:
+    """Считает веса классов для CrossEntropyLoss.
+
+    Классы с меньшим числом изображений получают больший вес, поэтому ошибки
+    на них сильнее штрафуются во время обучения.
+    """
+
     total = sum(counts)
     num_classes = len(counts)
     weights = [total / (num_classes * count) if count else 0.0 for count in counts]
@@ -197,6 +250,16 @@ def make_class_weights(counts: list[int], device: str) -> torch.Tensor:
 
 
 def build_model(model_name: str, num_classes: int, pretrained: bool) -> nn.Module:
+    """Создает timm-модель и заменяет classifier под наши классы.
+
+    Этап freeze:
+    - сначала замораживаются все параметры модели;
+    - обучаемой остается только новая классификационная голова.
+
+    Это transfer learning: backbone сохраняет полезные признаки ImageNet,
+    а classifier учится сопоставлять эти признаки с классами лабораторной.
+    """
+
     model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
     for parameter in model.parameters():
         parameter.requires_grad = False
@@ -206,11 +269,15 @@ def build_model(model_name: str, num_classes: int, pretrained: bool) -> nn.Modul
 
 
 def unfreeze_model(model: nn.Module) -> None:
+    """Разрешает обновлять все веса модели на этапе fine-tuning."""
+
     for parameter in model.parameters():
         parameter.requires_grad = True
 
 
 def make_optimizer(model: nn.Module, lr: float) -> torch.optim.Optimizer:
+    """Оптимизирует только параметры, у которых requires_grad=True."""
+
     return torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
         lr=lr,
@@ -224,6 +291,8 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: str,
 ) -> tuple[float, float]:
+    """Выполняет одну эпоху обучения и возвращает loss и accuracy."""
+
     model.train()
     losses: list[float] = []
     targets: list[int] = []
@@ -250,6 +319,8 @@ def train_one_epoch(
 def evaluate(
     model: nn.Module, loader: DataLoader, criterion: nn.Module, device: str
 ) -> tuple[float, float, list[int], list[int]]:
+    """Оценивает модель без градиентов и возвращает метрики/предсказания."""
+
     model.eval()
     losses: list[float] = []
     targets: list[int] = []
@@ -275,6 +346,8 @@ def save_plots(
     classes: list[str],
     artifact_config: ArtifactConfig,
 ) -> None:
+    """Сохраняет learning curves и confusion matrix для анализа в отчете."""
+
     artifact_config.log_dir.mkdir(parents=True, exist_ok=True)
 
     epochs = [item["epoch"] for item in history]
@@ -310,7 +383,10 @@ def export_onnx(
     model: nn.Module,
     config: ExperimentConfig,
 ) -> None:
+    """Экспортирует лучшую PyTorch-модель в ONNX для CPU-инференса в app."""
+
     model.eval().cpu()
+    # Dummy input задает форму тензора, которую ожидает экспортируемая модель.
     dummy_input = torch.randn(1, 3, config.data.image_size, config.data.image_size)
     output_path = config.artifacts.output_dir / config.artifacts.onnx_name
     torch.onnx.export(
@@ -329,6 +405,8 @@ def export_onnx(
 
 
 def sync_app_artifacts(config: ExperimentConfig) -> None:
+    """Копирует последние артефакты в experiments/models для app.py."""
+
     config.artifacts.deploy_dir.mkdir(parents=True, exist_ok=True)
     for file_name in (
         config.artifacts.onnx_name,
@@ -341,6 +419,8 @@ def sync_app_artifacts(config: ExperimentConfig) -> None:
 
 
 def run_training(config: ExperimentConfig) -> None:
+    """Основной pipeline: split данных, обучение, оценка, сохранение и экспорт."""
+
     set_seed(config.train.seed)
     config.artifacts.output_dir.mkdir(parents=True, exist_ok=True)
     config.artifacts.log_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +449,7 @@ def run_training(config: ExperimentConfig) -> None:
 
     for epoch in range(1, config.train.epochs + 1):
         if epoch == config.train.freeze_backbone_epochs + 1:
+            # Этап unfreeze: теперь backbone тоже обучается, но с меньшим LR.
             unfreeze_model(model)
             optimizer = make_optimizer(model, config.train.lr * config.train.unfreeze_lr_factor)
             print("[OK] Backbone unfrozen for fine-tuning.")
@@ -396,6 +477,7 @@ def run_training(config: ExperimentConfig) -> None:
         )
 
         if val_acc > best_val_acc:
+            # Сохраняем только checkpoint с лучшей validation accuracy.
             best_val_acc = val_acc
             best_targets = targets
             best_predictions = predictions
@@ -448,6 +530,8 @@ def run_training(config: ExperimentConfig) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """CLI-аргументы для повторения и изменения экспериментов из терминала."""
+
     parser = argparse.ArgumentParser(description="Train timm classifier and export ONNX.")
     parser.add_argument("--model-name", default=TrainConfig.model_name)
     parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
@@ -464,6 +548,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Собирает config из значений по умолчанию и CLI, затем запускает training."""
+
     args = parse_args()
     config = ExperimentConfig()
     config.train.model_name = args.model_name
@@ -477,6 +563,7 @@ def main() -> None:
     config.train.freeze_backbone_epochs = args.freeze_backbone_epochs
     config.data.force_resplit = args.force_resplit
     if args.run_name:
+        # run-name не дает разным экспериментам перезаписывать друг друга.
         run_dir = PROJECT_ROOT / "experiments" / "runs" / args.run_name
         config.artifacts.output_dir = run_dir / "models"
         config.artifacts.log_dir = run_dir / "logs"

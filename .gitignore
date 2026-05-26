@@ -1,0 +1,11 @@
+.venv/
+venv/
+venv_gradio/
+app/venv_gradio/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.sixth/
+
+experiments/models/*.pth
+experiments/models/*.onnx

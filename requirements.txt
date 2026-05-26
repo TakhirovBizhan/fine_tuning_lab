@@ -1,0 +1,11 @@
+torch
+torchvision
+timm
+numpy
+scikit-learn
+matplotlib
+seaborn
+Pillow
+gradio
+onnx
+onnxruntime

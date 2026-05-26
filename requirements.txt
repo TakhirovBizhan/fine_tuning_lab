@@ -9,3 +9,5 @@ Pillow
 gradio
 onnx
 onnxruntime
+pandas
+notebook

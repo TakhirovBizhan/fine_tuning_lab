@@ -1,0 +1,26 @@
+{
+  "model_name": "efficientnet_b0",
+  "pretrained": true,
+  "epochs": 5,
+  "batch_size": 16,
+  "lr": 0.0003,
+  "freeze_backbone_epochs": 2,
+  "use_class_weights": true,
+  "classes": [
+    "class1",
+    "class2",
+    "class3"
+  ],
+  "train_class_counts": {
+    "class1": 56,
+    "class2": 78,
+    "class3": 92
+  },
+  "best_val_acc": 1.0,
+  "artifacts": {
+    "checkpoint": "C:\\Users\\Тахиров Бижан\\Desktop\\6 семестр\\нейронка\\лаба3\\fine_tuning_lab\\experiments\\runs\\efficientnet_b0_lr0003\\models\\best_model.pth",
+    "onnx": "C:\\Users\\Тахиров Бижан\\Desktop\\6 семестр\\нейронка\\лаба3\\fine_tuning_lab\\experiments\\runs\\efficientnet_b0_lr0003\\models\\best_model.onnx",
+    "learning_curves": "C:\\Users\\Тахиров Бижан\\Desktop\\6 семестр\\нейронка\\лаба3\\fine_tuning_lab\\experiments\\runs\\efficientnet_b0_lr0003\\logs\\learning_curves.png",
+    "confusion_matrix": "C:\\Users\\Тахиров Бижан\\Desktop\\6 семестр\\нейронка\\лаба3\\fine_tuning_lab\\experiments\\runs\\efficientnet_b0_lr0003\\logs\\confusion_matrix.png"
+  }
+}

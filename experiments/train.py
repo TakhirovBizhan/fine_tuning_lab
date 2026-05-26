@@ -25,6 +25,7 @@ class DataConfig:
     processed_data_dir: Path = PROJECT_ROOT / "data" / "processed"
     train_ratio: float = 0.8
     image_size: int = 224
+    force_resplit: bool = False
     valid_exts: tuple[str, ...] = (
         ".jpg",
         ".jpeg",
@@ -47,6 +48,7 @@ class TrainConfig:
     num_workers: int = 0
     freeze_backbone_epochs: int = 2
     unfreeze_lr_factor: float = 0.1
+    use_class_weights: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -54,6 +56,7 @@ class TrainConfig:
 class ArtifactConfig:
     output_dir: Path = PROJECT_ROOT / "experiments" / "models"
     log_dir: Path = PROJECT_ROOT / "experiments" / "logs"
+    deploy_dir: Path = PROJECT_ROOT / "experiments" / "models"
     checkpoint_name: str = "best_model.pth"
     onnx_name: str = "best_model.onnx"
     classes_name: str = "classes.json"
@@ -89,6 +92,9 @@ def config_to_jsonable(config: ExperimentConfig) -> dict:
 
 
 def prepare_data(config: DataConfig, seed: int) -> None:
+    if config.force_resplit and config.processed_data_dir.exists():
+        shutil.rmtree(config.processed_data_dir)
+
     train_dir = config.processed_data_dir / "train"
     val_dir = config.processed_data_dir / "val"
     train_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +180,20 @@ def make_loaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, list
         num_workers=config.train.num_workers,
     )
     return train_loader, val_loader, train_dataset.classes
+
+
+def dataset_class_counts(dataset: datasets.ImageFolder, num_classes: int) -> list[int]:
+    counts = [0] * num_classes
+    for label in dataset.targets:
+        counts[label] += 1
+    return counts
+
+
+def make_class_weights(counts: list[int], device: str) -> torch.Tensor:
+    total = sum(counts)
+    num_classes = len(counts)
+    weights = [total / (num_classes * count) if count else 0.0 for count in counts]
+    return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
 def build_model(model_name: str, num_classes: int, pretrained: bool) -> nn.Module:
@@ -308,6 +328,18 @@ def export_onnx(
     print(f"[OK] ONNX exported: {output_path}")
 
 
+def sync_app_artifacts(config: ExperimentConfig) -> None:
+    config.artifacts.deploy_dir.mkdir(parents=True, exist_ok=True)
+    for file_name in (
+        config.artifacts.onnx_name,
+        config.artifacts.classes_name,
+        config.artifacts.checkpoint_name,
+    ):
+        source = config.artifacts.output_dir / file_name
+        if source.exists():
+            shutil.copy2(source, config.artifacts.deploy_dir / file_name)
+
+
 def run_training(config: ExperimentConfig) -> None:
     set_seed(config.train.seed)
     config.artifacts.output_dir.mkdir(parents=True, exist_ok=True)
@@ -316,11 +348,17 @@ def run_training(config: ExperimentConfig) -> None:
     prepare_data(config.data, config.train.seed)
     train_loader, val_loader, classes = make_loaders(config)
     num_classes = len(classes)
+    class_counts = dataset_class_counts(train_loader.dataset, num_classes)
 
     model = build_model(config.train.model_name, num_classes, config.train.pretrained).to(
         config.train.device
     )
-    criterion = nn.CrossEntropyLoss()
+    class_weights = (
+        make_class_weights(class_counts, config.train.device)
+        if config.train.use_class_weights
+        else None
+    )
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = make_optimizer(model, config.train.lr)
 
     best_val_acc = -1.0
@@ -380,11 +418,33 @@ def run_training(config: ExperimentConfig) -> None:
         json.dump(classes, file, ensure_ascii=False, indent=2)
 
     save_plots(history, best_targets, best_predictions, classes, config.artifacts)
+    summary = {
+        "model_name": config.train.model_name,
+        "pretrained": config.train.pretrained,
+        "epochs": config.train.epochs,
+        "batch_size": config.train.batch_size,
+        "lr": config.train.lr,
+        "freeze_backbone_epochs": config.train.freeze_backbone_epochs,
+        "use_class_weights": config.train.use_class_weights,
+        "classes": classes,
+        "train_class_counts": dict(zip(classes, class_counts)),
+        "best_val_acc": best_val_acc,
+        "artifacts": {
+            "checkpoint": str(checkpoint_path),
+            "onnx": str(config.artifacts.output_dir / config.artifacts.onnx_name),
+            "learning_curves": str(config.artifacts.log_dir / "learning_curves.png"),
+            "confusion_matrix": str(config.artifacts.log_dir / "confusion_matrix.png"),
+        },
+    }
+    with (config.artifacts.log_dir / "summary.json").open("w", encoding="utf-8") as file:
+        json.dump(summary, file, ensure_ascii=False, indent=2)
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
     export_onnx(model, config)
+    sync_app_artifacts(config)
     print(f"[OK] Best validation accuracy: {best_val_acc:.4f}")
+    print(f"[OK] App artifacts updated in: {config.artifacts.deploy_dir}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -396,6 +456,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
     parser.add_argument("--device", default=TrainConfig.device)
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--no-class-weights", action="store_true")
+    parser.add_argument("--force-resplit", action="store_true")
+    parser.add_argument("--run-name", default="")
     parser.add_argument("--freeze-backbone-epochs", type=int, default=TrainConfig.freeze_backbone_epochs)
     return parser.parse_args()
 
@@ -410,7 +473,13 @@ def main() -> None:
     config.train.seed = args.seed
     config.train.device = args.device
     config.train.pretrained = not args.no_pretrained
+    config.train.use_class_weights = not args.no_class_weights
     config.train.freeze_backbone_epochs = args.freeze_backbone_epochs
+    config.data.force_resplit = args.force_resplit
+    if args.run_name:
+        run_dir = PROJECT_ROOT / "experiments" / "runs" / args.run_name
+        config.artifacts.output_dir = run_dir / "models"
+        config.artifacts.log_dir = run_dir / "logs"
     run_training(config)
 
 
